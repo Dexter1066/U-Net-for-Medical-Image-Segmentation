@@ -27,7 +27,20 @@ class UnetConv2d(nn.Module):
         return self.DoubleConv(x)
 
 
+class UnetDown(nn.Module):
+    # maxpooling then double conv
+    def __init__(self, in_channels, out_channels):
+        super(UnetDown).__init__()
+        self.Down = nn.Sequential(
+            nn.MaxPool2d(2),
+            UnetConv2d(in_channels, out_channels)
+        )
+
+    def forward(self, x):
+        return self.Down(x)
+
 class UnetUp(nn.Module):
+    # upscaling then double conv
     def __init__(self, in_channels, out_channels, up_mode, padding=1, batch_norm=True):
         super(UnetUp).__init__()
 
