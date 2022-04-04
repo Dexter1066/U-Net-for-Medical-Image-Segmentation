@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class UnetConv2d(nn.Module):
@@ -22,7 +23,7 @@ class UnetConv2d(nn.Module):
                 nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=padding),
                 nn.ReLU(inplace=True)
             )
-    
+
     def forward(self, x):
         return self.DoubleConv(x)
 
@@ -39,30 +40,35 @@ class UnetDown(nn.Module):
     def forward(self, x):
         return self.Down(x)
 
+
 class UnetUp(nn.Module):
     # upscaling then double conv
-    def __init__(self, in_channels, out_channels, up_mode, padding=1, batch_norm=True):
+    def __init__(self, in_channels, out_channels, up_sample=True):
         super(UnetUp).__init__()
 
-        if up_mode == 'upconv':
-            self.up = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
-        elif up_mode == 'upsample':
-            self.up = nn.Sequential(
-                nn.Upsample(mode='bilinear', scale_factor=2),
-                nn.Conv2d(in_channels, out_channels, kernel_size=1)
-            )
-        self.Conv2d = UnetConv2d(in_channels, out_channels, padding, batch_norm)
+        if up_sample:
+            self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+        else:
+            self.up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
 
-    def CenterCrop(self, layer, target_size):
-        _, _, layer_height, layer_width = layer.size()
-        diff_x = (layer_width - target_size[1]) // 2
-        diff_y = (layer_height - target_size[0]) // 2
-        return layer[
-            :, :, diff_y : (diff_y + target_size[0]), diff_x : (diff_x + target_size[1])
-        ]
+        self.Conv2d = UnetConv2d(in_channels, out_channels)
 
-    def forward(self, x, bridge):
-        up = self.up(x)
-        crop = self.CenterCrop(bridge, up.shape[2:])
-        out = torch.cat([up, crop], 1)
+    def forward(self, x1, x2):
+        x1 = self.up(x1)
+
+        diff_x = torch.tensor([x2.size()[2] - x1.size()[2]])
+        diff_y = torch.tensor([x2.size()[3] - x1.size()[3]])
+        x1 = F.pad(x1, [diff_x // 2, diff_x - diff_x // 2,
+                        diff_y // 2, diff_y - diff_y // 2])
+
+        out = torch.cat([x2, x1], 1)
         return self.Conv2d(out)
+
+
+class OutConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(OutConv, self).__init__()
+        self.out = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        return self.conv(x)
