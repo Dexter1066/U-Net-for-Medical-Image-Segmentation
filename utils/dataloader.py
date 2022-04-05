@@ -5,20 +5,25 @@ from torch.utils.data import Dataset
 import glob
 import random
 
+from torch.utils.data.dataset import T_co
+
 
 class DataLoader(Dataset):
-    def __init__(self, path):
-        self.data_path = path
-        self.img_path = glob.glob(os.path.join(path, 'image/*.tif'))
+
+    def __init__(self, data_path):
+        self.data_path = data_path
+        self.img_path = glob.glob(os.path.join(data_path, 'images/*.tif'))
+        # print(data_path)
+        # print(self.img_path)
 
     def augment(self, image, flipcode):
         return cv2.flip(image, flipcode)
     
-    def get_image(self, index):
+    def __getitem__(self, index):
         image_path = self.img_path[index]
         # set the label path according to the image path
-        label_path = image_path.replace('image', 'label')
-        
+        label_path = image_path.replace('images', 'label')
+
         image = cv2.imread(image_path)
         label = cv2.imread(label_path)
 
@@ -38,3 +43,17 @@ class DataLoader(Dataset):
             label = self.augment(label, flipCode)
 
         return image, label
+
+    def __len__(self):
+        return len(self.img_path)
+
+
+if __name__ == "__main__":
+    isbi_dataset = DataLoader("../data/train/")
+    print("数据个数：", len(isbi_dataset))
+    train_loader = torch.utils.data.DataLoader(dataset=isbi_dataset,
+                                               batch_size=2,
+                                               shuffle=True)
+    for image, label in train_loader:
+        print(image.shape)
+        print(label.shape)

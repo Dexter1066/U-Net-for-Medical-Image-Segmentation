@@ -14,9 +14,9 @@ if __name__ == '__main__':
     model.load_state_dict(torch.load('best_model.pth', map_location=device))
     model.eval()
 
-    tests_path = glob.glob('data/test/*.png')
+    tests_path = glob.glob('data/test/*.tif')
     for test_path in tests_path:
-        save_res_path = test_path.split('.')[0] + '_res.png'
+        save_res_path = test_path.split('.')[0] + '_res.tif'
         img = cv2.imread(test_path)
         img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
         img = img.reshape(1, 1, img.shape[0], img.shape[1])

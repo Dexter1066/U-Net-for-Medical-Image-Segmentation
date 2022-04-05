@@ -1,4 +1,4 @@
-from layers import *
+from model.layers import *
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,10 +15,10 @@ class UNet(nn.Module):
         self.down1 = UnetDown(64, 128)
         self.down2 = UnetDown(128, 256)
         self.down3 = UnetDown(256, 512)
-        self.down4 = UnetDown(512, 1024)
+        self.down4 = UnetDown(512, 512)
 
-        self.up1 = UnetUp(1024, 512, up_sample)
-        self.up2 = UnetUp(512, 256, up_sample)
+        self.up1 = UnetUp(1024, 256, up_sample)
+        self.up2 = UnetUp(512, 128, up_sample)
         self.up3 = UnetUp(256, 64, up_sample)
         self.up4 = UnetUp(128, 64, up_sample)
         self.outc = OutConv(64, out_channels)
