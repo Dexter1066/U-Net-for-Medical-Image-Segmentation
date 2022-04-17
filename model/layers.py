@@ -27,6 +27,28 @@ class UnetConv2d(nn.Module):
     def forward(self, x):
         return self.DoubleConv(x)
 
+class UnetConv3D(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, padding=1, batch_norm=True):
+        super().__init__()
+
+        insert_channels = out_channels if in_channels > out_channels else out_channels // 2
+        if batch_norm:
+            self.DoubleConv = nn.Sequential(
+                nn.Conv3d(in_channels, insert_channels, kernel_size=kernel_size, stride=1, padding=padding),
+                nn.BatchNorm3d(insert_channels),
+                nn.ReLU(inplace=True),
+                nn.Conv3d(insert_channels, out_channels, kernel_size=kernel_size, stride=1, padding=padding),
+                nn.BatchNorm3d(out_channels),
+                nn.ReLU(inplace=True)
+            )
+        else:
+            self.DoubleConv = nn.Sequential(
+                nn.Conv3d(in_channels, insert_channels, kernel_size=kernel_size, stride=1, padding=padding),
+                nn.ReLU(inplace=True),
+                nn.Conv3d(insert_channels, out_channels, kernel_size=kernel_size, stride=1, padding=padding),
+                nn.ReLU(inplace=True)
+            )
+
 
 class UnetDown(nn.Module):
     # maxpooling then double conv
@@ -35,6 +57,19 @@ class UnetDown(nn.Module):
         self.Down = nn.Sequential(
             nn.MaxPool2d(2),
             UnetConv2d(in_channels, out_channels)
+        )
+
+    def forward(self, x):
+        return self.Down(x)
+
+
+class UnetDown3D(nn.Module):
+    # maxpooling then 3D conv
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.Down = nn.Sequential(
+            UnetConv3D(in_channels, out_channels),
+            nn.MaxPool3d(2, stride=2)
         )
 
     def forward(self, x):
