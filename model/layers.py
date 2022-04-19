@@ -27,13 +27,14 @@ class UnetConv2d(nn.Module):
     def forward(self, x):
         return self.DoubleConv(x)
 
+
 class UnetConv3D(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, padding=1, batch_norm=True):
         super().__init__()
 
         insert_channels = out_channels if in_channels > out_channels else out_channels // 2
         if batch_norm:
-            self.DoubleConv = nn.Sequential(
+            self.Conv = nn.Sequential(
                 nn.Conv3d(in_channels, insert_channels, kernel_size=kernel_size, stride=1, padding=padding),
                 nn.BatchNorm3d(insert_channels),
                 nn.ReLU(inplace=True),
@@ -42,7 +43,7 @@ class UnetConv3D(nn.Module):
                 nn.ReLU(inplace=True)
             )
         else:
-            self.DoubleConv = nn.Sequential(
+            self.Conv = nn.Sequential(
                 nn.Conv3d(in_channels, insert_channels, kernel_size=kernel_size, stride=1, padding=padding),
                 nn.ReLU(inplace=True),
                 nn.Conv3d(insert_channels, out_channels, kernel_size=kernel_size, stride=1, padding=padding),
@@ -98,6 +99,25 @@ class UnetUp(nn.Module):
 
         out = torch.cat([x2, x1], dim=1)
         return self.Conv2d(out)
+
+
+class UnetUp3D(nn.Module):
+    # upscaling then triple conv
+    def __init__(self, in_channels, out_channels, up_sample=True):
+        super().__init__()
+
+        if up_sample:
+            self.up = nn.Upsample(scale_factor=2, mode='trilinear')
+        else:
+            self.up = nn.ConvTranspose3d(in_channels, in_channels, kernel_size=2, stride=2)
+
+        self.Conv3d = UnetConv3D(in_channels + in_channels // 2, out_channels)
+
+    def forward(self, x1, x2):
+        x1 = self.up(x1)
+        x1 = torch.cat((x1, x2), dim=1)
+        x1 = self.Conv3d(x1)
+        return self.Conv2d(x1)
 
 
 class OutConv(nn.Module):
