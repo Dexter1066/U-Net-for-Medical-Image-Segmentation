@@ -14,3 +14,5 @@ SEGMENT_CLASS = {
 
 VOLUME_SLICES = 155
 VOLUME_START_AT = 22
+
+TRAIN_PATH = "../data/train/"
