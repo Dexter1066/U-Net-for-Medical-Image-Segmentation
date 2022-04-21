@@ -5,6 +5,7 @@ from torch.utils.data import Dataset
 import nibabel as nib
 import torch.nn.functional as F
 from PIL import Image, ImageOps
+from utils.DataAugmentation_BraTS import get_train_transform, get_val_transform
 
 
 SEGMENT_CLASS = {
@@ -62,7 +63,7 @@ def nib_load(file_name):
 
 
 class DataGenerator(Dataset):
-    def __init__(self, list_IDs, dim=(IMG_SIZE, IMG_SIZE), batch_size=1, n_channels=2, shuffle=True):
+    def __init__(self, data_dir, split='train', case_name=[], transform=None):
         self.list_IDs = list_IDs
         self.dim = dim
         self.batch_size = batch_size
