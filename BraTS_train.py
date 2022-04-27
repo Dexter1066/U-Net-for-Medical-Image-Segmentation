@@ -12,7 +12,8 @@ import numpy as np
 from tqdm import tqdm
 
 from sklearn.model_selection import train_test_split
-from skimage.io import imread, imsave
+import joblib
+from skimage.io import imread
 
 import torch
 import torch.nn as nn
@@ -25,15 +26,15 @@ import torch.backends.cudnn as cudnn
 import torchvision
 from torchvision import datasets, models, transforms
 
-from utils.dataloader_BraTS import Dataset
-
+from utils import dataloader_BraTS
+from utils.metrics import dice_coef, batch_iou, mean_iou, iou_score
+from utils import loss
+import pandas as pd
 from model.unet import UNet
-from model.Unet3d import UNet3d
-from utils.metrics import dice_coef, batch_iou, mean_iou, iou_score, ppv, sensitivity
-import utils.loss
-from sklearn.externals import joblib
-from hausdorff import hausdorff_distance
-import imageio
+
+arch_names = list(UNet.__dict__.keys())
+loss_names = list(loss.__dict__.keys())
+loss_names.append('BCEWithLogitsLoss')
 
 
 def str2bool(v):
@@ -53,55 +54,209 @@ def parse_args():
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--name', default=None,
-                        help='model name')
-    parser.add_argument('--mode', default=None,
-                        help='GetPicture or Calculate')
+                        help='model name: (default: arch+timestamp)')
+    parser.add_argument('--arch', '-a', metavar='ARCH', default='Unet',
+                        choices=arch_names,
+                        help='model architecture: ' +
+                            ' | '.join(arch_names) +
+                            ' (default: NestedUNet)')
+    parser.add_argument('--deepsupervision', default=False, type=str2bool)
+    parser.add_argument('--dataset', default="jiu0Monkey",
+                        help='dataset name')
+    parser.add_argument('--input-channels', default=4, type=int,
+                        help='input channels')
+    parser.add_argument('--image-ext', default='png',
+                        help='image file extension')
+    parser.add_argument('--mask-ext', default='png',
+                        help='mask file extension')
+    parser.add_argument('--aug', default=False, type=str2bool)
+    parser.add_argument('--loss', default='BCEDiceLoss',
+                        choices=loss_names,
+                        help='loss: ' +
+                            ' | '.join(loss_names) +
+                            ' (default: BCEDiceLoss)')
+    parser.add_argument('--epochs', default=10000, type=int, metavar='N',
+                        help='number of total epochs to run')
+    parser.add_argument('--early-stop', default=20, type=int,
+                        metavar='N', help='early stopping (default: 20)')
+    parser.add_argument('-b', '--batch-size', default=18, type=int,
+                        metavar='N', help='mini-batch size (default: 16)')
+    parser.add_argument('--optimizer', default='Adam',
+                        choices=['Adam', 'SGD'],
+                        help='loss: ' +
+                            ' | '.join(['Adam', 'SGD']) +
+                            ' (default: Adam)')
+    parser.add_argument('--lr', '--learning-rate', default=3e-4, type=float,
+                        metavar='LR', help='initial learning rate')
+    parser.add_argument('--momentum', default=0.9, type=float,
+                        help='momentum')
+    parser.add_argument('--weight-decay', default=1e-4, type=float,
+                        help='weight decay')
+    parser.add_argument('--nesterov', default=False, type=str2bool,
+                        help='nesterov')
 
     args = parser.parse_args()
 
     return args
 
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+
+def train(args, train_loader, model, criterion, optimizer, epoch, scheduler=None):
+    losses = AverageMeter()
+    ious = AverageMeter()
+
+    model.train()
+
+    for i, (input, target) in tqdm(enumerate(train_loader), total=len(train_loader)):
+        input = input.cuda()
+        target = target.cuda()
+
+        # compute output
+        if args.deepsupervision:
+            outputs = model(input)
+            loss = 0
+            for output in outputs:
+                loss += criterion(output, target)
+            loss /= len(outputs)
+            iou = iou_score(outputs[-1], target)
+        else:
+            output = model(input)
+            loss = criterion(output, target)
+            iou = iou_score(output, target)
+
+        losses.update(loss.item(), input.size(0))
+        ious.update(iou, input.size(0))
+
+        # compute gradient and do optimizing step
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    log = OrderedDict([
+        ('loss', losses.avg),
+        ('iou', ious.avg),
+    ])
+
+    return log
+
+
+def validate(args, val_loader, model, criterion):
+    losses = AverageMeter()
+    ious = AverageMeter()
+
+    # switch to evaluate mode
+    model.eval()
+
+    with torch.no_grad():
+        for i, (input, target) in tqdm(enumerate(val_loader), total=len(val_loader)):
+            input = input.cuda()
+            target = target.cuda()
+
+            # compute output
+            if args.deepsupervision:
+                outputs = model(input)
+                loss = 0
+                for output in outputs:
+                    loss += criterion(output, target)
+                loss /= len(outputs)
+                iou = iou_score(outputs[-1], target)
+            else:
+                output = model(input)
+                loss = criterion(output, target)
+                iou = iou_score(output, target)
+
+            losses.update(loss.item(), input.size(0))
+            ious.update(iou, input.size(0))
+
+    log = OrderedDict([
+        ('loss', losses.avg),
+        ('iou', ious.avg),
+    ])
+
+    return log
+
 
 def main():
-    val_args = parse_args()
+    args = parse_args()
+    #args.dataset = "datasets"
 
-    args = joblib.load('models/%s/args.pkl' % val_args.name)
 
-    if not os.path.exists('output/%s' % args.name):
-        os.makedirs('output/%s' % args.name)
+    if args.name is None:
+        if args.deepsupervision:
+            args.name = '%s_%s_wDS' %(args.dataset, args.arch)
+        else:
+            args.name = '%s_%s_woDS' %(args.dataset, args.arch)
+    if not os.path.exists('models/%s' %args.name):
+        os.makedirs('models/%s' %args.name)
 
     print('Config -----')
     for arg in vars(args):
-        print('%s: %s' % (arg, getattr(args, arg)))
+        print('%s: %s' %(arg, getattr(args, arg)))
     print('------------')
 
-    joblib.dump(args, 'model/%s/args.pkl' % args.name)
+    with open('models/%s/args.txt' %args.name, 'w') as f:
+        for arg in vars(args):
+            print('%s: %s' %(arg, getattr(args, arg)), file=f)
+
+    joblib.dump(args, 'models/%s/args.pkl' %args.name)
+
+    # define loss function (criterion)
+    if args.loss == 'BCEWithLogitsLoss':
+        criterion = nn.BCEWithLogitsLoss().cuda()
+    else:
+        criterion = loss.__dict__[args.loss]().cuda()
+
+    cudnn.benchmark = True
+
+    # Data loading code
+    img_paths = glob(r'D:\Project\CollegeDesign\dataset\Brats2018FoulModel2D\trainImage\*')
+    mask_paths = glob(r'D:\Project\CollegeDesign\dataset\Brats2018FoulModel2D\trainMask\*')
+
+    train_img_paths, val_img_paths, train_mask_paths, val_mask_paths = \
+        train_test_split(img_paths, mask_paths, test_size=0.2, random_state=41)
+    print("train_num:%s"%str(len(train_img_paths)))
+    print("val_num:%s"%str(len(val_img_paths)))
+
 
     # create model
-    print("=> creating model %s" % args.arch)
-    if args.name == 'UNet':
-        model = UNet.__dict__[args.arch](args)
-    elif args.name == 'UNet3d':
-        model = UNet3d.__dict__[args.arch](args)
-    else:
-        raise NotImplementedError
+    print("=> creating model %s" %args.arch)
+    model = UNet.__dict__[args.arch](args)
 
     model = model.cuda()
 
-    # Data loading code
-    img_paths = glob(r'D:\Project\CollegeDesign\dataset\Brats2018FoulModel2D\testImage\*')
-    mask_paths = glob(r'D:\Project\CollegeDesign\dataset\Brats2018FoulModel2D\testMask\*')
+    print(count_params(model))
 
-    val_img_paths = img_paths
-    val_mask_paths = mask_paths
+    if args.optimizer == 'Adam':
+        optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
+    elif args.optimizer == 'SGD':
+        optimizer = optim.SGD(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr,
+            momentum=args.momentum, weight_decay=args.weight_decay, nesterov=args.nesterov)
 
-    # train_img_paths, val_img_paths, train_mask_paths, val_mask_paths = \
-    #   train_test_split(img_paths, mask_paths, test_size=0.2, random_state=41)
+    train_dataset = dataloader_BraTS.Dataset(args, train_img_paths, train_mask_paths, args.aug)
+    val_dataset = dataloader_BraTS.Dataset(args, val_img_paths, val_mask_paths)
 
-    model.load_state_dict(torch.load('model/%s/model.pth' % args.name))
-    model.eval()
-
-    val_dataset = Dataset(args, val_img_paths, val_mask_paths)
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        pin_memory=True,
+        drop_last=True)
     val_loader = torch.utils.data.DataLoader(
         val_dataset,
         batch_size=args.batch_size,
@@ -109,238 +264,51 @@ def main():
         pin_memory=True,
         drop_last=False)
 
-    if val_args.mode == "GetPicture":
+    log = pd.DataFrame(index=[], columns=[
+        'epoch', 'lr', 'loss', 'iou', 'val_loss', 'val_iou'
+    ])
 
-        """
-        获取并保存模型生成的标签图
-        """
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore')
+    best_iou = 0
+    trigger = 0
+    for epoch in range(args.epochs):
+        print('Epoch [%d/%d]' %(epoch, args.epochs))
 
-            with torch.no_grad():
-                for i, (input, target) in tqdm(enumerate(val_loader), total=len(val_loader)):
-                    input = input.cuda()
-                    # target = target.cuda()
+        # train for one epoch
+        train_log = train(args, train_loader, model, criterion, optimizer, epoch)
+        # evaluate on validation set
+        val_log = validate(args, val_loader, model, criterion)
 
-                    # compute output
-                    if args.deepsupervision:
-                        output = model(input)[-1]
-                    else:
-                        output = model(input)
-                    # print("img_paths[i]:%s" % img_paths[i])
-                    output = torch.sigmoid(output).data.cpu().numpy()
-                    img_paths = val_img_paths[args.batch_size * i:args.batch_size * (i + 1)]
-                    # print("output_shape:%s"%str(output.shape))
+        print('loss %.4f - iou %.4f - val_loss %.4f - val_iou %.4f'
+            %(train_log['loss'], train_log['iou'], val_log['loss'], val_log['iou']))
 
-                    for i in range(output.shape[0]):
-                        """
-                        生成灰色圖片
-                        wtName = os.path.basename(img_paths[i])
-                        overNum = wtName.find(".npy")
-                        wtName = wtName[0:overNum]
-                        wtName = wtName + "_WT" + ".png"
-                        imsave('output/%s/'%args.name + wtName, (output[i,0,:,:]*255).astype('uint8'))
-                        tcName = os.path.basename(img_paths[i])
-                        overNum = tcName.find(".npy")
-                        tcName = tcName[0:overNum]
-                        tcName = tcName + "_TC" + ".png"
-                        imsave('output/%s/'%args.name + tcName, (output[i,1,:,:]*255).astype('uint8'))
-                        etName = os.path.basename(img_paths[i])
-                        overNum = etName.find(".npy")
-                        etName = etName[0:overNum]
-                        etName = etName + "_ET" + ".png"
-                        imsave('output/%s/'%args.name + etName, (output[i,2,:,:]*255).astype('uint8'))
-                        """
-                        npName = os.path.basename(img_paths[i])
-                        overNum = npName.find(".npy")
-                        rgbName = npName[0:overNum]
-                        rgbName = rgbName + ".png"
-                        rgbPic = np.zeros([160, 160, 3], dtype=np.uint8)
-                        for idx in range(output.shape[2]):
-                            for idy in range(output.shape[3]):
-                                if output[i, 0, idx, idy] > 0.5:
-                                    rgbPic[idx, idy, 0] = 0
-                                    rgbPic[idx, idy, 1] = 128
-                                    rgbPic[idx, idy, 2] = 0
-                                if output[i, 1, idx, idy] > 0.5:
-                                    rgbPic[idx, idy, 0] = 255
-                                    rgbPic[idx, idy, 1] = 0
-                                    rgbPic[idx, idy, 2] = 0
-                                if output[i, 2, idx, idy] > 0.5:
-                                    rgbPic[idx, idy, 0] = 255
-                                    rgbPic[idx, idy, 1] = 255
-                                    rgbPic[idx, idy, 2] = 0
-                        imsave('output/%s/' % args.name + rgbName, rgbPic)
+        tmp = pd.Series([
+            epoch,
+            args.lr,
+            train_log['loss'],
+            train_log['iou'],
+            val_log['loss'],
+            val_log['iou'],
+        ], index=['epoch', 'lr', 'loss', 'iou', 'val_loss', 'val_iou'])
 
-            torch.cuda.empty_cache()
-        """
-        将验证集中的GT numpy格式转换成图片格式并保存
-        """
-        print("Saving GT,numpy to picture")
-        val_gt_path = 'output/%s/' % args.name + "GT/"
-        if not os.path.exists(val_gt_path):
-            os.mkdir(val_gt_path)
-        for idx in tqdm(range(len(val_mask_paths))):
-            mask_path = val_mask_paths[idx]
-            name = os.path.basename(mask_path)
-            overNum = name.find(".npy")
-            name = name[0:overNum]
-            rgbName = name + ".png"
+        log = log.append(tmp, ignore_index=True)
+        log.to_csv('models/%s/log.csv' %args.name, index=False)
 
-            npmask = np.load(mask_path)
+        trigger += 1
 
-            GtColor = np.zeros([npmask.shape[0], npmask.shape[1], 3], dtype=np.uint8)
-            for idx in range(npmask.shape[0]):
-                for idy in range(npmask.shape[1]):
-                    # 坏疽(NET,non-enhancing tumor)(标签1) 红色
-                    if npmask[idx, idy] == 1:
-                        GtColor[idx, idy, 0] = 255
-                        GtColor[idx, idy, 1] = 0
-                        GtColor[idx, idy, 2] = 0
-                    # 浮肿区域(ED,peritumoral edema) (标签2) 绿色
-                    elif npmask[idx, idy] == 2:
-                        GtColor[idx, idy, 0] = 0
-                        GtColor[idx, idy, 1] = 128
-                        GtColor[idx, idy, 2] = 0
-                    # 增强肿瘤区域(ET,enhancing tumor)(标签4) 黄色
-                    elif npmask[idx, idy] == 4:
-                        GtColor[idx, idy, 0] = 255
-                        GtColor[idx, idy, 1] = 255
-                        GtColor[idx, idy, 2] = 0
+        if val_log['iou'] > best_iou:
+            torch.save(model.state_dict(), 'models/%s/model.pth' %args.name)
+            best_iou = val_log['iou']
+            print("=> saved best model")
+            trigger = 0
 
-            # imsave(val_gt_path + rgbName, GtColor)
-            imageio.imwrite(val_gt_path + rgbName, GtColor)
-            """
-            mask_path = val_mask_paths[idx]
-            name = os.path.basename(mask_path)
-            overNum = name.find(".npy")
-            name = name[0:overNum]
-            wtName = name + "_WT" + ".png"
-            tcName = name + "_TC" + ".png"
-            etName = name + "_ET" + ".png"
-            npmask = np.load(mask_path)
-            WT_Label = npmask.copy()
-            WT_Label[npmask == 1] = 1.
-            WT_Label[npmask == 2] = 1.
-            WT_Label[npmask == 4] = 1.
-            TC_Label = npmask.copy()
-            TC_Label[npmask == 1] = 1.
-            TC_Label[npmask == 2] = 0.
-            TC_Label[npmask == 4] = 1.
-            ET_Label = npmask.copy()
-            ET_Label[npmask == 1] = 0.
-            ET_Label[npmask == 2] = 0.
-            ET_Label[npmask == 4] = 1.
-            imsave(val_gt_path + wtName, (WT_Label * 255).astype('uint8'))
-            imsave(val_gt_path + tcName, (TC_Label * 255).astype('uint8'))
-            imsave(val_gt_path + etName, (ET_Label * 255).astype('uint8'))
-            """
-        print("Done!")
+        # early stopping
+        if not args.early_stop is None:
+            if trigger >= args.early_stop:
+                print("=> early stopping")
+                break
 
-    if val_args.mode == "Calculate":
-        """
-        计算各种指标:Dice、Sensitivity、PPV
-        """
-        wt_dices = []
-        tc_dices = []
-        et_dices = []
-        wt_sensitivities = []
-        tc_sensitivities = []
-        et_sensitivities = []
-        wt_ppvs = []
-        tc_ppvs = []
-        et_ppvs = []
-        wt_Hausdorf = []
-        tc_Hausdorf = []
-        et_Hausdorf = []
+        torch.cuda.empty_cache()
 
-        wtMaskList = []
-        tcMaskList = []
-        etMaskList = []
-        wtPbList = []
-        tcPbList = []
-        etPbList = []
-
-        maskPath = glob("output/%s/" % args.name + "GT\*.png")
-        pbPath = glob("output/%s/" % args.name + "*.png")
-        if len(maskPath) == 0:
-            print("请先生成图片!")
-            return
-
-        for myi in tqdm(range(len(maskPath))):
-            mask = imread(maskPath[myi])
-            pb = imread(pbPath[myi])
-
-            wtmaskregion = np.zeros([mask.shape[0], mask.shape[1]], dtype=np.float32)
-            wtpbregion = np.zeros([mask.shape[0], mask.shape[1]], dtype=np.float32)
-
-            tcmaskregion = np.zeros([mask.shape[0], mask.shape[1]], dtype=np.float32)
-            tcpbregion = np.zeros([mask.shape[0], mask.shape[1]], dtype=np.float32)
-
-            etmaskregion = np.zeros([mask.shape[0], mask.shape[1]], dtype=np.float32)
-            etpbregion = np.zeros([mask.shape[0], mask.shape[1]], dtype=np.float32)
-
-            for idx in range(mask.shape[0]):
-                for idy in range(mask.shape[1]):
-                    # 只要这个像素的任何一个通道有值,就代表这个像素不属于前景,即属于WT区域
-                    if mask[idx, idy, :].any() != 0:
-                        wtmaskregion[idx, idy] = 1
-                    if pb[idx, idy, :].any() != 0:
-                        wtpbregion[idx, idy] = 1
-                    # 只要第一个通道是255,即可判断是TC区域,因为红色和黄色的第一个通道都是255,区别于绿色
-                    if mask[idx, idy, 0] == 255:
-                        tcmaskregion[idx, idy] = 1
-                    if pb[idx, idy, 0] == 255:
-                        tcpbregion[idx, idy] = 1
-                    # 只要第二个通道是128,即可判断是ET区域
-                    if mask[idx, idy, 1] == 128:
-                        etmaskregion[idx, idy] = 1
-                    if pb[idx, idy, 1] == 128:
-                        etpbregion[idx, idy] = 1
-            # 开始计算WT
-            dice = dice_coef(wtpbregion, wtmaskregion)
-            wt_dices.append(dice)
-            ppv_n = ppv(wtpbregion, wtmaskregion)
-            wt_ppvs.append(ppv_n)
-            Hausdorff = hausdorff_distance(wtmaskregion, wtpbregion)
-            wt_Hausdorf.append(Hausdorff)
-            sensitivity_n = sensitivity(wtpbregion, wtmaskregion)
-            wt_sensitivities.append(sensitivity_n)
-            # 开始计算TC
-            dice = dice_coef(tcpbregion, tcmaskregion)
-            tc_dices.append(dice)
-            ppv_n = ppv(tcpbregion, tcmaskregion)
-            tc_ppvs.append(ppv_n)
-            Hausdorff = hausdorff_distance(tcmaskregion, tcpbregion)
-            tc_Hausdorf.append(Hausdorff)
-            sensitivity_n = sensitivity(tcpbregion, tcmaskregion)
-            tc_sensitivities.append(sensitivity_n)
-            # 开始计算ET
-            dice = dice_coef(etpbregion, etmaskregion)
-            et_dices.append(dice)
-            ppv_n = ppv(etpbregion, etmaskregion)
-            et_ppvs.append(ppv_n)
-            Hausdorff = hausdorff_distance(etmaskregion, etpbregion)
-            et_Hausdorf.append(Hausdorff)
-            sensitivity_n = sensitivity(etpbregion, etmaskregion)
-            et_sensitivities.append(sensitivity_n)
-
-        print('WT Dice: %.4f' % np.mean(wt_dices))
-        print('TC Dice: %.4f' % np.mean(tc_dices))
-        print('ET Dice: %.4f' % np.mean(et_dices))
-        print("=============")
-        print('WT PPV: %.4f' % np.mean(wt_ppvs))
-        print('TC PPV: %.4f' % np.mean(tc_ppvs))
-        print('ET PPV: %.4f' % np.mean(et_ppvs))
-        print("=============")
-        print('WT sensitivity: %.4f' % np.mean(wt_sensitivities))
-        print('TC sensitivity: %.4f' % np.mean(tc_sensitivities))
-        print('ET sensitivity: %.4f' % np.mean(et_sensitivities))
-        print("=============")
-        print('WT Hausdorff: %.4f' % np.mean(wt_Hausdorf))
-        print('TC Hausdorff: %.4f' % np.mean(tc_Hausdorf))
-        print('ET Hausdorff: %.4f' % np.mean(et_Hausdorf))
-        print("=============")
 
 
 if __name__ == '__main__':
