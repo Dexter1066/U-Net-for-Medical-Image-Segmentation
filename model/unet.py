@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 
 class UNet(nn.Module):
-    def __init__(self, in_channels, out_channels, up_sample=True):
+    def __init__(self, in_channels=3, out_channels=4, up_sample=True):
         super(UNet, self).__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -15,11 +15,11 @@ class UNet(nn.Module):
         self.down1 = UnetDown(64, 128)
         self.down2 = UnetDown(128, 256)
         self.down3 = UnetDown(256, 512)
-        self.down4 = UnetDown(512, 512)
+        self.down4 = UnetDown(512, 1024)
 
-        self.up1 = UnetUp(1024, 256, up_sample)
-        self.up2 = UnetUp(512, 128, up_sample)
-        self.up3 = UnetUp(256, 64, up_sample)
+        self.up1 = UnetUp(1024, 512, up_sample)
+        self.up2 = UnetUp(512, 256, up_sample)
+        self.up3 = UnetUp(256, 128, up_sample)
         self.up4 = UnetUp(128, 64, up_sample)
         self.outc = OutConv(64, out_channels)
 
